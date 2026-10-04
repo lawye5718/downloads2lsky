@@ -52,6 +52,7 @@ DEFAULTS = {
     "extensions": ["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tif",
                    "tiff", "mp4", "mov", "avi", "mkv", "webm", "m4v", "mpg", "mpeg",
                    "flv", "wmv", "3gp", "ogv"],
+    "gallery_verify_secret": "",   # Lsky 的 GALLERY_VERIFY_SECRET，用于拉取全站图片 md5 查重
 }
 
 SKIP_DIR_PREFIXES = (".",)  # 跳过隐藏目录（.Trashes / .com.apple... / 等）
@@ -230,6 +231,57 @@ def sha256_of(path):
     return h.hexdigest()
 
 
+def sha256_and_md5(path):
+    """一次读取同时算出 sha256（本地 manifest 去重）与 md5（与 Lsky 云端比对）。"""
+    h1 = hashlib.sha256()
+    h2 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h1.update(chunk)
+            h2.update(chunk)
+    return h1.hexdigest(), h2.hexdigest()
+
+
+def fetch_lsky_md5_index(cfg):
+    """拉取 Lsky 全部图片的 md5 → {md5: {key,url,name}}，用于上传前内容查重。
+
+    意义：用户可能已「手动上传」过同内容到 Lsky，若只按本地 manifest 去重会重复上传。
+    未配置密钥或请求失败时返回 {}（本次退化为不查重，不影响正常上传）。
+    """
+    secret = (cfg.get("gallery_verify_secret") or "").strip()
+    if not secret:
+        logging.warning("未配置 gallery_verify_secret，跳过 Lsky 内容查重（建议补上以防重复图）")
+        return {}
+    base = cfg["lsky_base_url"].rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    use_ssl = parsed.scheme == "https"
+    try:
+        conn = (http.client.HTTPSConnection if use_ssl else http.client.HTTPConnection)(host, port, timeout=60)
+        conn.request("GET", "/api/gallery/images?limit=5000",
+                     headers={"X-Gallery-Verify-Key": secret, "Accept": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        conn.close()
+        data = json.loads(raw) if raw else {}
+        rows = data.get("data") or []
+        idx = {}
+        for r in rows:
+            md5 = (r.get("md5") or "").lower()
+            if md5 and md5 not in idx:
+                idx[md5] = {
+                    "key": r.get("key") or "",
+                    "url": "%s/%s.%s" % (base, r.get("key"), r.get("extension")),
+                    "name": r.get("name") or "",
+                }
+        logging.info("Lsky 内容索引：%d 个唯一 md5（用于上传前查重）", len(idx))
+        return idx
+    except Exception as e:
+        logging.warning("拉取 Lsky 内容索引失败，本次不查重：%s", e)
+        return {}
+
+
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -290,9 +342,13 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
 
     now = datetime.datetime.now()
     uploaded_count = 0
+    dedup_count = 0
     skipped_count = 0
     failed_count = 0
     deleted_count = 0
+
+    # 云端内容索引：md5 → 图，用于上传前查重（覆盖「用户手动上传过」的情况）
+    lsky_index = fetch_lsky_md5_index(cfg)
 
     logging.info("扫描 %s (扩展名=%d 种, 保留期=%d 天)", downloads_dir, len(cfg["extensions"]), retention_days)
     try:
@@ -335,8 +391,8 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
                 skipped_count += 1
                 continue
 
-        # 新路径：计算 sha，检查内容是否已上传过
-        sha = sha256_of(path)
+        # 新路径：计算 sha256（本地 manifest 去重）与 md5（与 Lsky 云端比对）
+        sha, md5 = sha256_and_md5(path)
         if sha in manifest:
             e = manifest[sha]
             if e.get("uploaded"):
@@ -347,6 +403,24 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
                 skipped_count += 1
                 logging.info("内容已在 Lsky（按 sha 去重），更新路径: %s", path)
                 continue
+
+        # 云端查重：用户可能已手动上传过同内容 → 不重复上传，标记为已上传（仍按保留期删本地）
+        hit = lsky_index.get(md5)
+        if hit:
+            if dry_run:
+                logging.info("[DRY] 云端已有同内容(md5=%s…)，将标记为已上传并纳入保留期删除: %s", md5[:8], path)
+                dedup_count += 1
+                continue
+            manifest[sha] = {
+                "path": path, "name": os.path.basename(path), "size": st.st_size,
+                "sha256": sha, "md5": md5,
+                "lsky_url": hit.get("url", ""), "key": hit.get("key", ""),
+                "uploaded_at": now_iso(), "uploaded": True, "deleted_local": False,
+                "dedup": "lsky-md5",
+            }
+            dedup_count += 1
+            logging.info("Lsky 已有同内容（md5 命中），标记为已上传：%s -> %s", path, hit.get("url", ""))
+            continue
 
         # 真正的新文件 -> 上传
         if dry_run:
@@ -405,9 +479,9 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
     if not dry_run:
         save_manifest(manifest)
 
-    logging.info("本次结果: 新上传=%d, 跳过(已上传)=%d, 失败=%d, 删本地=%d",
-                 uploaded_count, skipped_count, failed_count, deleted_count)
-    return {"uploaded": uploaded_count, "skipped": skipped_count,
+    logging.info("本次结果: 新上传=%d, 云端查重跳过=%d, 跳过(已上传)=%d, 失败=%d, 删本地=%d",
+                 uploaded_count, dedup_count, skipped_count, failed_count, deleted_count)
+    return {"uploaded": uploaded_count, "dedup": dedup_count, "skipped": skipped_count,
             "failed": failed_count, "deleted": deleted_count}
 
 
