@@ -53,6 +53,7 @@ DEFAULTS = {
                    "tiff", "mp4", "mov", "avi", "mkv", "webm", "m4v", "mpg", "mpeg",
                    "flv", "wmv", "3gp", "ogv"],
     "gallery_verify_secret": "",   # Lsky 的 GALLERY_VERIFY_SECRET，用于拉取全站图片 md5 查重
+    "max_upload_retries": 5,       # 同一内容连续失败 N 次后列入"永久跳过"（Lsky 不支持的格式等）
 }
 
 SKIP_DIR_PREFIXES = (".",)  # 跳过隐藏目录（.Trashes / .com.apple... / 等）
@@ -242,6 +243,22 @@ def sha256_and_md5(path):
     return h1.hexdigest(), h2.hexdigest()
 
 
+def baseline_missing(e):
+    """manifest 条目是否还没记录 size/mtime 基准（老条目没有）。"""
+    return e.get("size") is None or e.get("mtime_ns") is None
+
+
+def unchanged(e, st):
+    """按 size + mtime_ns 判断"该路径上的内容"是否与上次处理时一致。
+
+    不能只看路径：像「复刻参考图…(N).jpeg」这类会被反复覆盖重生成的文件，
+    路径不变但内容每次都不同；若仅靠路径索引跳过，新内容会被永久漏传。
+    """
+    if baseline_missing(e):
+        return False
+    return int(e["size"]) == int(st.st_size) and int(e["mtime_ns"]) == int(st.st_mtime_ns)
+
+
 def fetch_lsky_md5_index(cfg):
     """拉取 Lsky 全部图片的 md5 → {md5: {key,url,name}}，用于上传前内容查重。
 
@@ -346,6 +363,8 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
     skipped_count = 0
     failed_count = 0
     deleted_count = 0
+    manifest_dirty = False
+    max_retries = int(cfg.get("max_upload_retries", 5) or 0)
 
     # 云端内容索引：md5 → 图，用于上传前查重（覆盖「用户手动上传过」的情况）
     lsky_index = fetch_lsky_md5_index(cfg)
@@ -375,21 +394,42 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
             logging.debug("跳过（修改于 %.1f 分钟内，可能未下载完）: %s", age_min, path)
             continue
 
+        # 2026-10-20 修复：路径索引只能证明"这个路径处理过"，不能证明"现在的内容处理过"。
+        # 必须先用 size+mtime_ns 校验内容是否被覆盖/重生成，否则同路径新内容会被永久漏传。
         existing_sha = path_index.get(path)
         if existing_sha is not None:
             e = manifest[existing_sha]
-            if e.get("preexisting"):
-                skipped_count += 1
-                logging.debug("跳过（既有文件，忽略）: %s", path)
-                continue
-            if e.get("uploaded") and not e.get("deleted_local"):
-                skipped_count += 1
-                logging.debug("跳过（已上传且在保留期内）: %s", path)
-                continue
-            if e.get("uploaded") and e.get("deleted_local"):
-                # 内容已在 Lsky，本地已被删；不重复上传
-                skipped_count += 1
-                continue
+            if unchanged(e, st):
+                if e.get("preexisting"):
+                    skipped_count += 1
+                    logging.debug("跳过（既有文件，忽略）: %s", path)
+                    continue
+                if e.get("uploaded"):
+                    skipped_count += 1
+                    logging.debug("跳过（已上传，内容未变）: %s", path)
+                    continue
+                # 已知失败的（Lsky 不支持的格式等），超过重试上限就别再每 6 小时重试一次
+                if (e.get("failed_attempts") or 0) >= max_retries:
+                    if not e.get("quarantined"):
+                        e["quarantined"] = True
+                        logging.warning(
+                            "永久跳过（已失败 %d 次，最后错误：%s）: %s",
+                            e.get("failed_attempts"), e.get("last_error", ""), path)
+                    else:
+                        logging.debug("跳过（已列入永久失败）: %s", path)
+                    skipped_count += 1
+                    continue
+            else:
+                if e.get("preexisting") and baseline_missing(e):
+                    # 老条目补一把 size/mtime 基准，之后内容再变才会被当成新文件
+                    e["size"] = st.st_size
+                    e["mtime_ns"] = st.st_mtime_ns
+                    manifest_dirty = True
+                    skipped_count += 1
+                    continue
+                logging.info("同路径内容已变化（覆盖/重生成），按新文件校验: %s", path)
+                e.pop("path", None)  # 旧条目让位，避免与新内容的条目抢占同一路径
+                existing_sha = None
 
         # 新路径：计算 sha256（本地 manifest 去重）与 md5（与 Lsky 云端比对）
         sha, md5 = sha256_and_md5(path)
@@ -400,6 +440,8 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
                 e["path"] = path
                 e["name"] = os.path.basename(path)
                 e["size"] = st.st_size
+                e["mtime_ns"] = st.st_mtime_ns
+                manifest_dirty = True
                 skipped_count += 1
                 logging.info("内容已在 Lsky（按 sha 去重），更新路径: %s", path)
                 continue
@@ -413,6 +455,7 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
                 continue
             manifest[sha] = {
                 "path": path, "name": os.path.basename(path), "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
                 "sha256": sha, "md5": md5,
                 "lsky_url": hit.get("url", ""), "key": hit.get("key", ""),
                 "uploaded_at": now_iso(), "uploaded": True, "deleted_local": False,
@@ -435,6 +478,7 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
                 "path": path,
                 "name": os.path.basename(path),
                 "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
                 "sha256": sha,
                 "lsky_url": d.get("links", {}).get("url", ""),
                 "key": d.get("key", ""),
@@ -447,7 +491,18 @@ def run(cfg, dry_run=False, retention_override=None, upload_all=False):
             time.sleep(1)  # 温和限速
         else:
             failed_count += 1
-            logging.warning("上传失败: %s | %s", path, data.get("message", ""))
+            msg = data.get("message", "")
+            logging.warning("上传失败: %s | %s", path, msg)
+            # 记入 manifest：重试达上限后自动转为永久跳过，避免每 6 小时重复报同一批文件
+            prev = manifest.get(sha, {})
+            manifest[sha] = {
+                "path": path, "name": os.path.basename(path),
+                "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                "sha256": sha, "md5": md5,
+                "uploaded": False, "deleted_local": False,
+                "failed_attempts": int(prev.get("failed_attempts") or 0) + 1,
+                "last_error": msg, "last_attempt": now_iso(),
+            }
             if data.get("_stop"):
                 logging.warning("今日上传额度用尽，停止本次上传，剩余文件留待后续运行")
                 break
